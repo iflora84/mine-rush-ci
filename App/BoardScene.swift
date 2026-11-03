@@ -510,7 +510,7 @@ final class BoardScene: SKScene {
         minScale = min(side / 56, start)
         maxScale = max(fitAll, start)
         cam.setScale(start)
-        cam.position = CGPoint(x: 0, y: .greatestFiniteMagnitude)
+        cam.position = CGPoint(x: 0, y: CGFloat.greatestFiniteMagnitude)
         clampCamera()
     }
 
