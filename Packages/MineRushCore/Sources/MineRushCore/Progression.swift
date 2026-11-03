@@ -281,6 +281,8 @@ public struct ExpeditionRun: Codable, Sendable {
         public var bonusPercent = 0
         /// Power-ups awarded for clearing the site.
         public var drops: [PowerUp] = []
+
+        public init() {}
     }
 
     public func isMagnetActive(at now: Double) -> Bool {

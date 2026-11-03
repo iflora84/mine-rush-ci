@@ -17,6 +17,8 @@ public struct ArcadeOutcome: Equatable, Sendable {
     public var newBoard = false
     /// Endless: a life was spent on a mine.
     public var lostLife = false
+
+    public init() {}
 }
 
 private func applyBasic(_ move: ArcadeMove, to board: inout MinesweeperBoard, shield: Bool) -> (RevealResult, FlagChange?) {
