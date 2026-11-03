@@ -8,6 +8,8 @@ struct BoardSnapshot: Equatable {
     var treasures: Set<Coord> = []
     var scanned: Coord?
     var dimSatisfied = false
+    /// Dark Mine: only these tiles are drawn; nil means everything is visible.
+    var lit: Set<Coord>?
 
     static func == (a: BoardSnapshot, b: BoardSnapshot) -> Bool {
         a.board.seed == b.board.seed
@@ -17,6 +19,7 @@ struct BoardSnapshot: Equatable {
             && a.treasures == b.treasures
             && a.scanned == b.scanned
             && a.dimSatisfied == b.dimSatisfied
+            && a.lit == b.lit
     }
 }
 
@@ -58,6 +61,8 @@ private struct TileTextures {
     let revealed: SKTexture
     let treasure: SKTexture
     let triggered: SKTexture
+    let darkHidden: SKTexture
+    let darkOpen: SKTexture
     let scanRing: SKTexture
     let spark: SKTexture
     let flag = SKTexture(imageNamed: "icon_flag")
@@ -108,6 +113,18 @@ private struct TileTextures {
         revealed = recessed(fill: .cream)
         treasure = recessed(fill: UIColor(hex: 0xFFE3A0))
         triggered = recessed(fill: .coral)
+        // In the dark you can still tell dug from undug, so tapping is never a blind guess.
+        darkHidden = raised(face: UIColor(hex: 0x2E4660), edge: UIColor(hex: 0x16233A), highlight: UIColor(hex: 0x4D6A8A), lift: s * 0.1)
+        darkOpen = SKTexture(image: renderer.image { _ in
+            let outer = CGRect(x: 0, y: 0, width: s, height: s).insetBy(dx: inset, dy: inset)
+            UIColor(hex: 0x0B131D).setFill()
+            UIBezierPath(roundedRect: outer, cornerRadius: radius * 0.7).fill()
+            var inner = outer.insetBy(dx: s * 0.03, dy: s * 0.03)
+            inner.origin.y += s * 0.04
+            inner.size.height -= s * 0.04
+            UIColor(hex: 0x182434).setFill()
+            UIBezierPath(roundedRect: inner, cornerRadius: radius * 0.6).fill()
+        })
         scanRing = SKTexture(image: renderer.image { _ in
             let ring = UIBezierPath(roundedRect: CGRect(x: 0, y: 0, width: s, height: s).insetBy(dx: s * 0.06, dy: s * 0.06),
                                     cornerRadius: radius)
@@ -221,7 +238,10 @@ final class BoardScene: SKScene {
 
     func apply(_ new: BoardSnapshot) {
         let board = new.board
-        let resized = board.rows != rows || board.cols != cols
+        // Endless Depth grows downward mid-game: add rows without resetting the view.
+        let grew = snapshot?.board.seed == board.seed && board.cols == cols && board.rows > rows && rows > 0
+        if grew { addRows(to: board.rows) }
+        let resized = !grew && (board.rows != rows || board.cols != cols)
         if resized { build(rows: board.rows, cols: board.cols) }
         let isNewBoard = resized
             || snapshot?.board.seed != board.seed
@@ -247,7 +267,8 @@ final class BoardScene: SKScene {
             let cell = board[coord]
             render(tile, cell: cell, coord: coord, snapshot: new)
 
-            guard let before = old?.board[coord] else {
+            // Rows that just grew in (Endless) have no previous state to diff against.
+            guard let oldBoard = old?.board, oldBoard.contains(coord) else {
                 if isNewBoard && motion {
                     tile.setScale(0)
                     tile.run(.sequence([
@@ -259,6 +280,7 @@ final class BoardScene: SKScene {
                 }
                 continue
             }
+            let before = oldBoard[coord]
             if before.state != .revealed, cell.state == .revealed, !cell.isMine {
                 revealedCount += 1
                 if motion { pop(tile, delay: rippleDelay(to: coord)) }
@@ -313,7 +335,36 @@ final class BoardScene: SKScene {
         }
     }
 
+    /// Appends tile nodes for new rows, re-centres every tile, and moves the camera
+    /// by the same amount so the player's view doesn't jump.
+    private func addRows(to newRows: Int) {
+        let added = newRows - rows
+        for _ in 0..<(added * cols) {
+            let tile = TileNode(side: side)
+            boardNode.addChild(tile)
+            tiles.append(tile)
+        }
+        rows = newRows
+        for (i, tile) in tiles.enumerated() {
+            tile.position = position(of: Coord(row: i / cols, col: i % cols))
+        }
+        cam.position.y += CGFloat(added) * side / 2
+        updateZoomLimits()
+        clampCamera()
+    }
+
     private func render(_ tile: TileNode, cell: Cell, coord: Coord, snapshot: BoardSnapshot) {
+        if let lit = snapshot.lit, !lit.contains(coord) {
+            tile.texture = cell.state == .revealed ? textures.darkOpen : textures.darkHidden
+            tile.label.text = nil
+            tile.icon.texture = cell.state == .flagged ? textures.flag : nil
+            tile.icon.alpha = 0.6
+            tile.ring.isHidden = true
+            tile.isAccessibilityElement = true
+            let what = cell.state == .revealed ? "dug" : cell.state == .flagged ? "flagged" : "not dug"
+            tile.accessibilityLabel = "Row \(coord.row + 1), column \(coord.col + 1), dark, \(what)"
+            return
+        }
         let status = snapshot.board.status
         let showsMine = cell.isMine && !cell.isDefused && (cell.state == .revealed || status.isOver)
         var triggered = false
@@ -482,6 +533,149 @@ final class BoardScene: SKScene {
         }
     }
 
+    // MARK: Item and combo effects
+
+    func play(_ event: FXEvent) {
+        let motion = !feedback.reduceMotion
+        switch event.kind {
+        case .blast(let c):
+            feedback.play(.boom, volume: 0.85)
+            feedback.haptic(.error)
+            guard motion, isOnBoard(c) else { return }
+            let p = position(of: c)
+            let boom = SKSpriteNode(texture: textures.explosion)
+            boom.size = CGSize(width: side * 3.2, height: side * 3.2)
+            boom.position = p
+            boom.zPosition = 15
+            boom.setScale(0.2)
+            effects.addChild(boom)
+            boom.run(.sequence([
+                .group([.scale(to: 1.15, duration: 0.18), .rotate(byAngle: 0.3, duration: 0.18)]),
+                .group([.fadeOut(withDuration: 0.35), .scale(to: 1.4, duration: 0.35)]),
+                .removeFromParent(),
+            ]))
+            shockwave(at: p, color: .coral, radius: side * 3)
+            burst(at: p, colors: [.gold, .coral, .cream], count: 80, speed: 380)
+            shake(strength: 14)
+
+        case .radar(let center, let mines):
+            feedback.play(.scan)
+            feedback.haptic(.medium)
+            guard isOnBoard(center) else { return }
+            if motion {
+                for i in 0..<3 {
+                    shockwave(at: position(of: center), color: .turquoise, radius: side * 3.2, delay: Double(i) * 0.22)
+                }
+            }
+            // The markers are information, so they show even with Reduce Motion.
+            for (n, mine) in mines.enumerated() {
+                let marker = SKSpriteNode(texture: textures.bomb)
+                marker.size = CGSize(width: side * 0.72, height: side * 0.72)
+                marker.position = position(of: mine)
+                marker.zPosition = 12
+                marker.alpha = 0
+                let ring = SKShapeNode(rectOf: CGSize(width: side * 0.92, height: side * 0.92), cornerRadius: side * 0.18)
+                ring.strokeColor = .coral
+                ring.lineWidth = side * 0.07
+                ring.glowWidth = motion ? side * 0.08 : 0
+                marker.addChild(ring)
+                effects.addChild(marker)
+                let pulse = SKAction.sequence([.scale(to: 1.12, duration: 0.25), .scale(to: 1, duration: 0.25)])
+                marker.run(.sequence([
+                    .wait(forDuration: motion ? 0.2 + Double(n) * 0.05 : 0),
+                    .fadeIn(withDuration: 0.15),
+                    motion
+                        ? SKAction.repeat(pulse, count: Int(PowerUp.radarSeconds / 0.5))
+                        : SKAction.wait(forDuration: PowerUp.radarSeconds),
+                    .fadeOut(withDuration: 0.35),
+                    .removeFromParent(),
+                ]))
+            }
+
+        case .xray(let row):
+            feedback.play(.shield)
+            feedback.haptic(.medium)
+            guard row >= 0, row < rows else { return }
+            let y = position(of: Coord(row: row, col: 0)).y
+            let strip = SKSpriteNode(color: UIColor(hex: 0x7FF3FF, alpha: 0.35), size: CGSize(width: boardSize.width, height: side))
+            strip.position = CGPoint(x: 0, y: y)
+            strip.zPosition = 11
+            effects.addChild(strip)
+            strip.run(.sequence([.wait(forDuration: 0.6), .fadeOut(withDuration: 0.5), .removeFromParent()]))
+            guard motion else { return }
+            let beam = SKSpriteNode(color: UIColor(hex: 0xBFFAFF), size: CGSize(width: side * 0.22, height: side * 1.3))
+            beam.position = CGPoint(x: -boardSize.width / 2, y: y)
+            beam.zPosition = 13
+            let glow = SKSpriteNode(color: UIColor(hex: 0x20B9AD, alpha: 0.5), size: CGSize(width: side * 0.7, height: side * 1.5))
+            glow.zPosition = -1
+            beam.addChild(glow)
+            effects.addChild(beam)
+            let sweep = SKAction.moveTo(x: boardSize.width / 2, duration: 0.45)
+            sweep.timingMode = .easeInEaseOut
+            beam.run(.sequence([sweep, .fadeOut(withDuration: 0.15), .removeFromParent()]))
+
+        case .combo(let tier, _):
+            feedback.play(.coin, volume: 0.6 + Float(tier) * 0.1)
+            feedback.haptic(tier >= 2 ? .success : .medium)
+            guard motion else { return }
+            boardNode.run(.sequence([.scale(to: 1 + 0.015 * CGFloat(tier), duration: 0.08), .scale(to: 1, duration: 0.12)]))
+            let corners = [CGPoint(x: -1, y: -1), CGPoint(x: 1, y: -1), CGPoint(x: -1, y: 1), CGPoint(x: 1, y: 1)]
+            for corner in corners {
+                burst(at: CGPoint(x: corner.x * boardSize.width / 2, y: corner.y * boardSize.height / 2),
+                      colors: [.gold, .coral, .white], count: 12 * tier, speed: 220)
+            }
+
+        case .bigOpen:
+            guard motion, let origin = lastTouched else { return }
+            shockwave(at: position(of: origin), color: .gold, radius: side * 5)
+
+        case .magnet:
+            feedback.play(.coin)
+            feedback.haptic(.success)
+
+        case .bossIntro, .bossDefeated, .drops, .timeBonus, .newBest:
+            break // full-screen only; see FXOverlay
+
+        case .lifeLost:
+            feedback.play(.boom, volume: 0.7)
+            feedback.haptic(.error)
+            if motion { shake(strength: 10) }
+        }
+    }
+
+    private func isOnBoard(_ c: Coord) -> Bool {
+        c.row >= 0 && c.row < rows && c.col >= 0 && c.col < cols
+    }
+
+    private func shockwave(at point: CGPoint, color: UIColor, radius: CGFloat, delay: TimeInterval = 0) {
+        let ring = SKShapeNode(circleOfRadius: 10)
+        ring.strokeColor = color
+        ring.lineWidth = 5
+        ring.glowWidth = 4
+        ring.position = point
+        ring.zPosition = 14
+        ring.alpha = 0
+        effects.addChild(ring)
+        let grow = SKAction.scale(to: radius / 10, duration: 0.55)
+        grow.timingMode = .easeOut
+        ring.run(.sequence([
+            .wait(forDuration: delay),
+            .fadeAlpha(to: 1, duration: 0),
+            .group([grow, .sequence([.wait(forDuration: 0.2), .fadeOut(withDuration: 0.35)])]),
+            .removeFromParent(),
+        ]))
+    }
+
+    private func shake(strength: CGFloat) {
+        boardNode.removeAction(forKey: "shake")
+        let steps = (0..<10).map { i -> SKAction in
+            let falloff = 1 - CGFloat(i) / 10
+            return .moveBy(x: (i.isMultiple(of: 2) ? 1 : -1) * strength * falloff,
+                           y: (i.isMultiple(of: 3) ? 1 : -1) * strength * 0.6 * falloff, duration: 0.03)
+        }
+        boardNode.run(.sequence(steps + [.move(to: .zero, duration: 0.04)]), withKey: "shake")
+    }
+
     // MARK: Camera
 
     private var boardSize: CGSize {
@@ -503,15 +697,23 @@ final class BoardScene: SKScene {
     /// Fits the board's width to the view; tall boards start at the top and pan.
     private func fitCamera() {
         guard rows > 0, size.width > 10, size.height > 10 else { return }
-        let fitWidth = boardSize.width / (size.width - 8)
-        let fitAll = max(fitWidth, boardSize.height / (size.height - 8))
-        let start = boardSize.height / fitWidth <= size.height - 8 ? fitAll : fitWidth
-        // Zooming in stops when tiles reach 56pt on screen.
-        minScale = min(side / 56, start)
-        maxScale = max(fitAll, start)
+        let start = updateZoomLimits()
         cam.setScale(start)
         cam.position = CGPoint(x: 0, y: CGFloat.greatestFiniteMagnitude)
         clampCamera()
+    }
+
+    /// Zoom range: in to 56pt tiles, out to the whole board. Returns the starting
+    /// scale, which fits the width (tall boards then start at the top and pan).
+    @discardableResult
+    private func updateZoomLimits() -> CGFloat {
+        guard size.width > 10, size.height > 10 else { return cam.xScale }
+        let fitWidth = boardSize.width / (size.width - 8)
+        let fitAll = max(fitWidth, boardSize.height / (size.height - 8))
+        let start = boardSize.height / fitWidth <= size.height - 8 ? fitAll : fitWidth
+        minScale = min(side / 56, start)
+        maxScale = max(fitAll, start)
+        return start
     }
 
     private func clampCamera() {

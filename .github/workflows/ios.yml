@@ -71,6 +71,8 @@ jobs:
             CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED=NO AD_HOC_CODE_SIGNING_ALLOWED=YES \
             | tee build/archive.log | grep -E "error:|\*\* ARCHIVE" || true
           grep -q "\*\* ARCHIVE SUCCEEDED \*\*" build/archive.log
+          # Missing privacy manifests only surface days later as an ITMS-91053 email.
+          test -f "build/${SCHEME}.xcarchive/Products/Applications/${SCHEME}.app/PrivacyInfo.xcprivacy"
 
       - name: App Store Connect API key
         if: github.event_name != 'pull_request' && !endsWith(github.repository, '-ci')

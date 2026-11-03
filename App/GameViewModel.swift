@@ -3,7 +3,7 @@ import Foundation
 import MineRushCore
 
 enum PlayMode: String, CaseIterable, Identifiable {
-    case expedition, classic, daily
+    case expedition, classic, daily, arcade
 
     var id: String { rawValue }
     var title: String {
@@ -11,6 +11,7 @@ enum PlayMode: String, CaseIterable, Identifiable {
         case .expedition: return "Expedition"
         case .classic: return "Classic"
         case .daily: return "Daily"
+        case .arcade: return "Arcade"
         }
     }
 }
@@ -39,7 +40,7 @@ struct RewardPop: Identifiable, Equatable {
 /// player's profile (so it's saved and paid through the ledger); Classic and
 /// Daily boards are local and never touch the economy.
 @MainActor
-final class GameViewModel: ObservableObject {
+final class GameViewModel: ObservableObject, BoardHost {
     let store: PlayerStore
 
     @Published var mode: PlayMode = .expedition {
@@ -55,6 +56,10 @@ final class GameViewModel: ObservableObject {
     @Published private(set) var scannedCell: Coord?
     @Published private(set) var pop: RewardPop?
     @Published private(set) var message: String?
+    /// A power-up waiting for the player to pick its target tile.
+    @Published var armedItem: PowerUp?
+    /// Effects for the full-screen overlay and the board scene.
+    let fx = PassthroughSubject<FXEvent, Never>()
 
     @Published private var classicBoard: MinesweeperBoard
     @Published private var dailyBoard: MinesweeperBoard?
@@ -91,7 +96,18 @@ final class GameViewModel: ObservableObject {
         case .expedition: return store.profile.activeRun?.board
         case .classic: return classicBoard
         case .daily: return dailyBoard
+        case .arcade: return nil // ArcadeViewModel owns arcade boards
         }
+    }
+
+    var snapshot: BoardSnapshot? {
+        guard let board else { return nil }
+        return BoardSnapshot(
+            board: board,
+            treasures: run?.treasureCells.filter { board[$0].state == .revealed } ?? [],
+            scanned: scannedCell,
+            dimSatisfied: smartFlagsLevel > 0
+        )
     }
 
     var run: ExpeditionRun? {
@@ -112,19 +128,40 @@ final class GameViewModel: ObservableObject {
         smartFlagsLevel >= 2 ? 0.18 : 0.3
     }
 
-    func isTreasure(_ c: Coord) -> Bool {
-        guard let run, run.treasureCells.contains(c) else { return false }
-        return run.board[c].state == .revealed
-    }
-
     var dailyDoneToday: Bool {
         store.profile.daily.lastCompletedDay == todayKey
+    }
+
+    /// Wall-clock seconds, saved with the run so Magnet survives a relaunch.
+    static var now: Double { Date().timeIntervalSince1970 }
+
+    var inventory: Inventory { store.profile.inventory }
+
+    /// Live combo count (0 once the window lapses). Redrawn by the clock ticker.
+    var comboCount: Int {
+        guard let run, run.combo.isAlive(at: Self.now) else { return 0 }
+        return run.combo.count
+    }
+
+    var magnetSecondsLeft: Int {
+        guard let until = run?.magnetUntil, !(run?.board.status.isOver ?? true) else { return 0 }
+        return max(0, Int((until - Self.now).rounded(.up)))
+    }
+
+    var boss: BossDefinition? {
+        guard let run, run.isBoss else { return nil }
+        return BossCatalog.boss(for: run.zone)
     }
 
     // MARK: Input
 
     func tap(_ c: Coord) {
         guard let board, canPlay else { return }
+        if let item = armedItem {
+            armedItem = nil
+            perform(.item(item, c))
+            return
+        }
         let cell = board[c]
         if cell.state == .revealed {
             perform(.chord(c))
@@ -137,6 +174,10 @@ final class GameViewModel: ObservableObject {
 
     func longPress(_ c: Coord) {
         guard let board, canPlay else { return }
+        if armedItem != nil {
+            tap(c)
+            return
+        }
         if flagMode, board[c].state == .hidden {
             perform(.reveal(c))
         } else {
@@ -148,6 +189,20 @@ final class GameViewModel: ObservableObject {
         guard mode == .expedition, canPlay else { return }
         perform(.scan)
         if scannedCell == nil { message = "No tile is certain yet. Read the numbers." }
+    }
+
+    /// Magnet fires at once; the others arm and wait for a tile tap.
+    func useItem(_ item: PowerUp) {
+        guard mode == .expedition, canPlay else { return }
+        guard inventory[item] > 0 else {
+            message = "Out of \(item.name). Find more by clearing sites or buy them in Upgrades."
+            return
+        }
+        if item.needsTarget {
+            armedItem = armedItem == item ? nil : item
+        } else {
+            perform(.item(item, Coord(row: 0, col: 0)))
+        }
     }
 
     private var canPlay: Bool {
@@ -165,6 +220,8 @@ final class GameViewModel: ObservableObject {
         case .daily:
             dailyBoard = dailyOriginal
             resetSession()
+        case .arcade:
+            break
         }
     }
 
@@ -181,8 +238,9 @@ final class GameViewModel: ObservableObject {
                 PuzzleSolver.generateBoard(config: spec.config, seed: seed, opening: spec.opening, requireNoGuess: true)
             }.value
             guard ticket == generation else { return }
-            store.mutate { $0.startExpedition(in: zone, board: board) }
+            let run = store.mutate { $0.startExpedition(in: zone, board: board) }
             isGenerating = false
+            if run.isBoss { fx.send(FXEvent(.bossIntro(BossDefinitionRef(BossCatalog.boss(for: zone))))) }
         }
     }
 
@@ -212,6 +270,7 @@ final class GameViewModel: ObservableObject {
         generation += 1 // drop any board still generating for the previous mode
         isGenerating = false
         resetSession()
+        armedItem = nil
         switch mode {
         case .expedition:
             if let run = store.profile.activeRun {
@@ -221,7 +280,7 @@ final class GameViewModel: ObservableObject {
             }
         case .daily:
             loadDaily()
-        case .classic:
+        case .classic, .arcade:
             break
         }
     }
@@ -233,10 +292,12 @@ final class GameViewModel: ObservableObject {
         let flag: FlagChange?
         switch mode {
         case .expedition:
-            guard let outcome = store.mutate(save: false, { $0.playExpedition(move) }) else { return }
+            let now = Self.now
+            guard let outcome = store.mutate(save: false, { $0.playExpedition(move, now: now) }) else { return }
             result = outcome.result
             flag = outcome.flag
             scannedCell = outcome.scanned
+            emitEffects(for: outcome, move: move)
             if outcome.tileCoins > 0 { showPop("+\(outcome.tileCoins.compact)") }
             if !outcome.treasures.isEmpty { message = "Treasure found!" }
             if result.shieldedMine != nil { message = "Your helmet blocked a blast!" }
@@ -250,8 +311,33 @@ final class GameViewModel: ObservableObject {
             dailyBoard = board
             result = applied.0
             flag = applied.1
+        case .arcade:
+            return
         }
         react(to: result, flag: flag)
+    }
+
+    private func emitEffects(for outcome: ExpeditionRun.MoveOutcome, move: ExpeditionRun.Move) {
+        if case .item(let item, let c) = move, outcome.usedItem != nil {
+            switch item {
+            case .dynamite: fx.send(FXEvent(.blast(c)))
+            case .radar: fx.send(FXEvent(.radar(center: c, mines: outcome.radarMines)))
+            case .xray: fx.send(FXEvent(.xray(row: c.row)))
+            case .magnet: fx.send(FXEvent(.magnet))
+            }
+        }
+        if let tier = outcome.comboTierUp {
+            fx.send(FXEvent(.combo(tier: tier, count: run?.combo.count ?? 0)))
+        }
+        if outcome.result.revealed.count >= 25 {
+            fx.send(FXEvent(.bigOpen(outcome.result.revealed.count)))
+        }
+        if outcome.result.didWin, let boss {
+            fx.send(FXEvent(.bossDefeated(boss.name)))
+        }
+        if !outcome.drops.isEmpty {
+            fx.send(FXEvent(.drops(outcome.drops)))
+        }
     }
 
     private static func apply(_ move: ExpeditionRun.Move, to board: inout MinesweeperBoard) -> (RevealResult, FlagChange?) {
@@ -259,7 +345,7 @@ final class GameViewModel: ObservableObject {
         case .reveal(let c): return (board.reveal(c), nil)
         case .chord(let c): return (board.chord(c), nil)
         case .flag(let c): return (.empty, board.toggleFlag(c))
-        case .scan: return (.empty, nil)
+        case .scan, .item: return (.empty, nil) // Expedition-only tools
         }
     }
 
@@ -293,6 +379,8 @@ final class GameViewModel: ObservableObject {
             message = firstToday
                 ? "Daily cleared! Streak: \(store.profile.daily.streak)"
                 : "Cleared again in \(durationText(seconds))"
+        case .arcade:
+            break
         }
     }
 

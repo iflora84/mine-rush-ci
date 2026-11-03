@@ -52,6 +52,15 @@ struct UpgradesScreen: View {
     var body: some View {
         NavigationStack {
             List {
+                Section {
+                    ForEach(PowerUp.allCases, id: \.self) { item in
+                        itemRow(item)
+                    }
+                } header: {
+                    Text("Power-ups")
+                } footer: {
+                    Text("Use them in Expedition and Endless Depth. Every cleared site drops one; bosses drop three.")
+                }
                 ForEach(UpgradeCategory.allCases, id: \.self) { category in
                     Section(category.title) {
                         ForEach(UpgradeCatalog.all.filter { $0.category == category }, id: \.id) { def in
@@ -70,6 +79,36 @@ struct UpgradesScreen: View {
                 Button("OK", role: .cancel) {}
             }
         }
+    }
+
+    private func itemRow(_ item: PowerUp) -> some View {
+        let owned = store.profile.inventory[item]
+        let affordable = store.profile.ledger.coins >= item.price
+        return HStack(spacing: 12) {
+            Art.powerUp(item).resizable().scaledToFit().frame(width: 44, height: 44)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack {
+                    Text(item.name).font(.headline)
+                    Text("x\(owned)").font(.subheadline.bold().monospacedDigit()).foregroundStyle(.secondary)
+                }
+                Text(item.summary).font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button {
+                let outcome = store.mutate { $0.buyItem(item) }
+                notice = purchaseMessage(outcome)
+                if notice == nil {
+                    FeedbackService.shared.haptic(.success)
+                    FeedbackService.shared.play(.coin)
+                }
+            } label: {
+                ArtLabel(text: item.price.compact, image: Art.coin, size: 18)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(affordable ? Palette.gold : .gray)
+            .foregroundStyle(Palette.navy)
+        }
+        .padding(.vertical, 4)
     }
 
     private func row(_ def: UpgradeDefinition) -> some View {

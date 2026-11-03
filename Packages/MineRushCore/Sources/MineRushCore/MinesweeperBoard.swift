@@ -86,6 +86,8 @@ public struct RevealResult: Equatable, Sendable {
     public var hitMine: Coord?
     /// A mine that would have ended the game but was absorbed by a shield.
     public var shieldedMine: Coord?
+    /// Mines made safe by a power-up (dynamite, X-ray) during this move.
+    public var defused: [Coord] = []
     public var didWin = false
 
     public static let empty = RevealResult()
@@ -143,12 +145,16 @@ public enum MineGenerator {
 }
 
 public struct MinesweeperBoard: Codable, Sendable {
-    public let config: BoardConfig
+    /// Only grows, and only in Endless Depth (`appendRows`).
+    public private(set) var config: BoardConfig
     public let seed: UInt64
     public private(set) var cells: [Cell]
     public private(set) var status: GameStatus = .ready
     public private(set) var revealedSafeCount = 0
     public private(set) var flagCount = 0
+    /// Floods never open rows at or below this one. Endless Depth keeps its
+    /// newest rows sealed until the rows beneath them exist.
+    public private(set) var floodLimitRow: Int?
 
     public init(config: BoardConfig, seed: UInt64) {
         self.config = config
@@ -278,10 +284,104 @@ public struct MinesweeperBoard: Codable, Sendable {
         allCoords.filter { self[$0].isMine }
     }
 
+    // MARK: Power-ups
+
+    /// Cells within `radius` of `c` (a square), clipped to the board.
+    public func area(around c: Coord, radius: Int) -> [Coord] {
+        var result: [Coord] = []
+        for r in (c.row - radius)...(c.row + radius) {
+            for col in (c.col - radius)...(c.col + radius) {
+                let p = Coord(row: r, col: col)
+                if contains(p) { result.append(p) }
+            }
+        }
+        return result
+    }
+
+    public func row(_ r: Int) -> [Coord] {
+        guard r >= 0, r < rows else { return [] }
+        return (0..<cols).map { Coord(row: r, col: $0) }
+    }
+
+    /// Radar: where the mines are in `coords`. Read-only.
+    public func mines(in coords: [Coord]) -> [Coord] {
+        coords.filter { contains($0) && self[$0].isMine }
+    }
+
+    /// Dynamite: opens the 3x3 around `c`. Mines inside are defused instead of
+    /// going off, and wrong flags inside are cleared.
+    @discardableResult
+    public mutating func blast(_ c: Coord) -> RevealResult {
+        guard contains(c), status == .playing else { return .empty }
+        var result = RevealResult()
+        for p in area(around: c, radius: 1) where !self[p].isDefused && self[p].state != .revealed {
+            if self[p].isMine {
+                lockAsDefused(p)
+                result.defused.append(p)
+            } else {
+                if self[p].state == .flagged {
+                    cells[index(p)].state = .hidden
+                    flagCount -= 1
+                }
+                floodReveal(from: p, into: &result)
+            }
+        }
+        checkWin(&result)
+        return result
+    }
+
+    /// X-ray: every mine in `coords` becomes a locked, correct flag.
+    @discardableResult
+    public mutating func defuseMines(in coords: [Coord]) -> RevealResult {
+        guard status == .playing else { return .empty }
+        var result = RevealResult()
+        for p in coords where contains(p) && self[p].isMine && !self[p].isDefused {
+            lockAsDefused(p)
+            result.defused.append(p)
+        }
+        return result
+    }
+
+    // MARK: Endless Depth
+
+    /// Adds `count` rows below the board with mines at `mineIndices` (relative to
+    /// the new block), recomputes the numbers along the old bottom edge, and seals
+    /// the last `sealedRows` rows from floods.
+    public mutating func appendRows(_ count: Int, mineIndices: Set<Int>, sealedRows: Int) {
+        guard count > 0 else { return }
+        let oldRows = rows
+        let valid = mineIndices.filter { $0 >= 0 && $0 < count * cols }
+        config = BoardConfig(exactRows: oldRows + count, cols: cols, mines: config.mines + valid.count)
+        cells += Array(repeating: Cell(), count: count * cols)
+        for i in valid { cells[oldRows * cols + i].isMine = true }
+        for r in max(oldRows - 1, 0)..<rows {
+            for col in 0..<cols {
+                let i = r * cols + col
+                guard !cells[i].isMine else { continue }
+                cells[i].adjacentMines = neighbors(of: Coord(row: r, col: col)).filter { cells[index($0)].isMine }.count
+            }
+        }
+        floodLimitRow = rows - sealedRows
+    }
+
+    /// Seals rows at or below `row` from floods without adding any.
+    public mutating func sealRows(from row: Int) {
+        floodLimitRow = row
+    }
+
     // MARK: Internals
 
     func index(_ c: Coord) -> Int { c.row * cols + c.col }
     func coord(_ i: Int) -> Coord { Coord(row: i / cols, col: i % cols) }
+
+    /// Like `defuse`, but keeps the flag count right when the mine was already flagged.
+    private mutating func lockAsDefused(_ c: Coord) {
+        if self[c].state == .flagged {
+            cells[index(c)].isDefused = true
+        } else {
+            defuse(c)
+        }
+    }
 
     private mutating func defuse(_ c: Coord) {
         let i = index(c)
@@ -312,7 +412,8 @@ public struct MinesweeperBoard: Codable, Sendable {
             revealedSafeCount += 1
             result.revealed.append(c)
             if cells[i].adjacentMines == 0 {
-                queue.append(contentsOf: neighbors(of: c).filter { cells[index($0)].state == .hidden })
+                let limit = floodLimitRow ?? .max
+                queue.append(contentsOf: neighbors(of: c).filter { cells[index($0)].state == .hidden && $0.row < limit })
             }
         }
     }

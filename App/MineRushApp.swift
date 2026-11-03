@@ -1,3 +1,4 @@
+import Combine
 import MineRushCore
 import SpriteKit
 import SwiftUI
@@ -7,16 +8,18 @@ struct MineRushApp: App {
     // Built once here: App.init runs a single time, unlike a View's init.
     @StateObject private var store: PlayerStore
     @StateObject private var game: GameViewModel
+    @StateObject private var arcade: ArcadeViewModel
 
     init() {
         let store = PlayerStore()
         _store = StateObject(wrappedValue: store)
         _game = StateObject(wrappedValue: GameViewModel(store: store))
+        _arcade = StateObject(wrappedValue: ArcadeViewModel(store: store))
     }
 
     var body: some Scene {
         WindowGroup {
-            RootView(store: store, game: game)
+            RootView(store: store, game: game, arcade: arcade)
         }
     }
 }
@@ -64,8 +67,12 @@ enum Art {
     static var helmet: Image { Image("icon_helmet") }
     static var explosion: Image { Image("icon_explosion") }
 
+    static var magnet: Image { powerUp(.magnet) }
+
     static func worker(_ id: WorkerID) -> Image { Image("worker_\(id.rawValue)") }
     static func backdrop(_ zone: ZoneID) -> Image { Image("bg_\(zone.rawValue)") }
+    static func boss(_ zone: ZoneID) -> Image { Image("boss_\(zone.rawValue)") }
+    static func powerUp(_ item: PowerUp) -> Image { Image("powerup_\(item.rawValue)") }
 
     static func upgrade(_ id: UpgradeID) -> Image {
         switch id {
@@ -98,11 +105,12 @@ struct ArtLabel: View {
 struct RootView: View {
     @ObservedObject var store: PlayerStore
     @ObservedObject var game: GameViewModel
+    @ObservedObject var arcade: ArcadeViewModel
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         TabView {
-            GameScreen(game: game, store: store)
+            GameScreen(game: game, arcade: arcade, store: store)
                 .tabItem { Label("Play", systemImage: "hammer.fill") }
             UpgradesScreen(store: store)
                 .tabItem { Label("Upgrades", systemImage: "arrow.up.circle.fill") }
@@ -131,6 +139,7 @@ struct RootView: View {
                 FeedbackService.shared.startMusic()
             } else {
                 game.pause()
+                arcade.pause()
                 store.resignedActive()
                 FeedbackService.shared.pauseMusic()
             }
@@ -140,6 +149,7 @@ struct RootView: View {
 
 struct GameScreen: View {
     @ObservedObject var game: GameViewModel
+    @ObservedObject var arcade: ArcadeViewModel
     @ObservedObject var store: PlayerStore
     @State private var showZones = false
     @State private var showSettings = false
@@ -162,25 +172,37 @@ struct GameScreen: View {
             }
             .pickerStyle(.segmented)
 
-            modeHeader
-            statusRow
+            if game.mode == .arcade {
+                ArcadeScreen(arcade: arcade)
+            } else {
+                modeHeader
+                statusRow
 
-            ZStack {
-                if let board = game.board, !game.isGenerating {
-                    BoardView(game: game, board: board)
-                } else {
-                    ProgressView("Surveying the site…")
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                ZStack {
+                    if let snapshot = game.snapshot, !game.isGenerating {
+                        BoardView(host: game, snapshot: snapshot)
+                    } else {
+                        ProgressView("Surveying the site…")
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
                 }
-            }
-            .frame(maxHeight: .infinity)
-            .overlay(alignment: .top) { feedback }
+                .frame(maxHeight: .infinity)
+                .overlay(alignment: .top) { feedback }
 
-            controls
+                if game.mode == .expedition { itemBar }
+                controls
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
         .background(backdrop.ignoresSafeArea())
+        .overlay {
+            if game.mode == .arcade {
+                FXOverlay(events: arcade.fx)
+            } else {
+                FXOverlay(events: game.fx, magnetSecondsLeft: game.magnetSecondsLeft)
+            }
+        }
         .sheet(isPresented: $showSettings) {
             SettingsScreen()
         }
@@ -191,6 +213,9 @@ struct GameScreen: View {
                     game.startSite(in: zone)
                 }
             }
+        }
+        .onChange(of: game.mode) { old, _ in
+            if old == .arcade { arcade.pause() }
         }
         .alert("Leave this site?", isPresented: $confirmNewSite) {
             Button("New site", role: .destructive) { game.restart() }
@@ -236,11 +261,16 @@ struct GameScreen: View {
                 .padding(10)
                 .background(RoundedRectangle(cornerRadius: 12).fill(.white.opacity(0.7)))
             }
+            if let boss = game.boss, let run = game.run {
+                bossBar(boss, run: run)
+            }
         case .classic:
             Picker("Difficulty", selection: $game.difficulty) {
                 ForEach(Difficulty.allCases) { Text($0.title).tag($0) }
             }
             .pickerStyle(.segmented)
+        case .arcade:
+            EmptyView()
         case .daily:
             HStack {
                 Text("Daily \(game.todayKey)").font(.headline)
@@ -253,12 +283,45 @@ struct GameScreen: View {
         }
     }
 
+    private func bossBar(_ boss: BossDefinition, run: ExpeditionRun) -> some View {
+        let health = BossCatalog.health(of: run.board)
+        return HStack(spacing: 10) {
+            Art.boss(boss.zone).resizable().scaledToFit().frame(width: 48, height: 48)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack {
+                    Text(boss.name).font(.headline.bold())
+                    Text(boss.title).font(.caption.bold()).foregroundStyle(Palette.coral)
+                    Spacer()
+                    Text("\(health.left)/\(health.total)").font(.caption.monospacedDigit())
+                }
+                ProgressView(value: Double(health.left), total: Double(max(health.total, 1)))
+                    .tint(health.left * 4 < health.total ? Palette.coral : Palette.grass)
+                    .scaleEffect(x: 1, y: 2.2, anchor: .center)
+                    .animation(.easeOut(duration: 0.3), value: health.left)
+            }
+        }
+        .foregroundStyle(.white)
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Palette.navy.opacity(0.88)))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Boss \(boss.name), \(health.left) of \(health.total) health left")
+    }
+
     private var statusRow: some View {
         HStack {
             ArtLabel(text: "\(game.board?.minesRemaining ?? 0)", image: Art.flag, size: 26)
                 .foregroundStyle(Palette.navy)
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel("\(game.board?.minesRemaining ?? 0) mines left")
+            if game.comboCount >= 2 {
+                Text("COMBO x\(game.comboCount)")
+                    .font(.subheadline.weight(.black))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 8).padding(.vertical, 3)
+                    .background(Capsule().fill(game.comboCount >= 10 ? Palette.coral : Palette.gold))
+                    .transition(.scale.combined(with: .opacity))
+                    .id(game.comboCount)
+            }
             Spacer()
             Text(statusText)
                 .font(.headline)
@@ -309,6 +372,52 @@ struct GameScreen: View {
     }
 
     // MARK: Controls
+
+    private var itemBar: some View {
+        VStack(spacing: 4) {
+            if let armed = game.armedItem {
+                Text("Tap a tile to use \(armed.name). Tap the item again to cancel.")
+                    .font(.caption.bold())
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 10).padding(.vertical, 4)
+                    .background(Capsule().fill(Palette.coral))
+            }
+            HStack(spacing: 8) {
+                ForEach(PowerUp.allCases, id: \.self) { item in
+                    let count = game.inventory[item]
+                    Button {
+                        game.useItem(item)
+                    } label: {
+                        Art.powerUp(item).resizable().scaledToFit()
+                            .frame(width: 40, height: 40)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 4)
+                            .background(
+                                RoundedRectangle(cornerRadius: 12)
+                                    .fill(game.armedItem == item ? Palette.coral.opacity(0.35) : Color.white.opacity(0.75))
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 12)
+                                    .strokeBorder(game.armedItem == item ? Palette.coral : Palette.navy.opacity(0.15),
+                                                  lineWidth: game.armedItem == item ? 3 : 1)
+                            )
+                            .overlay(alignment: .topTrailing) {
+                                Text("\(count)")
+                                    .font(.caption2.bold().monospacedDigit())
+                                    .foregroundStyle(.white)
+                                    .padding(.horizontal, 6).padding(.vertical, 2)
+                                    .background(Capsule().fill(count > 0 ? Palette.navy : Color.gray))
+                                    .offset(x: 4, y: -4)
+                            }
+                            .opacity(count > 0 ? 1 : 0.45)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(game.board?.status != .playing)
+                    .accessibilityLabel("\(item.name), \(count) left. \(item.summary)")
+                }
+            }
+        }
+    }
 
     private var controls: some View {
         HStack(spacing: 10) {
@@ -366,57 +475,62 @@ struct GameScreen: View {
     }
 }
 
+/// What a board screen needs from whoever runs the game (Expedition/Classic/Daily or Arcade).
+@MainActor
+protocol BoardHost: ObservableObject {
+    var snapshot: BoardSnapshot? { get }
+    var isPaused: Bool { get }
+    var longPressDuration: Double { get }
+    var fx: PassthroughSubject<FXEvent, Never> { get }
+    func tap(_ c: Coord)
+    func longPress(_ c: Coord)
+    func togglePause()
+}
+
 /// The SpriteKit board, or a plain SwiftUI grid while VoiceOver is running
 /// (every tile is then a real accessibility element with a double-tap action).
-struct BoardView: View {
-    @ObservedObject var game: GameViewModel
-    let board: MinesweeperBoard
+struct BoardView<Host: BoardHost>: View {
+    @ObservedObject var host: Host
+    let snapshot: BoardSnapshot
     @State private var scene = BoardScene(size: CGSize(width: 390, height: 600))
     @Environment(\.accessibilityVoiceOverEnabled) private var voiceOver
 
     var body: some View {
         Group {
             if voiceOver {
-                AccessibleBoardGrid(game: game, board: board)
+                AccessibleBoardGrid(host: host, snapshot: snapshot)
             } else {
                 SpriteView(scene: scene, options: [.allowsTransparency])
                     .onAppear {
-                        scene.onTap = { game.tap($0) }
-                        scene.onLongPress = { game.longPress($0) }
-                        scene.longPressDuration = game.longPressDuration
+                        scene.onTap = { host.tap($0) }
+                        scene.onLongPress = { host.longPress($0) }
+                        scene.longPressDuration = host.longPressDuration
                         scene.apply(snapshot)
                     }
                     .onChange(of: snapshot) { _, new in
-                        scene.longPressDuration = game.longPressDuration
+                        scene.longPressDuration = host.longPressDuration
                         scene.apply(new)
                     }
+                    .onReceive(host.fx) { scene.play($0) }
             }
         }
         .overlay {
-            if game.isPaused {
+            if host.isPaused {
                 RoundedRectangle(cornerRadius: 16)
                     .fill(Palette.navy.opacity(0.92))
                     .overlay(Text("Paused").font(.largeTitle.bold()).foregroundStyle(.white))
-                    .onTapGesture { game.togglePause() }
+                    .onTapGesture { host.togglePause() }
             }
         }
     }
-
-    private var snapshot: BoardSnapshot {
-        BoardSnapshot(
-            board: board,
-            treasures: game.run?.treasureCells.filter { board[$0].state == .revealed } ?? [],
-            scanned: game.scannedCell,
-            dimSatisfied: game.smartFlagsLevel > 0
-        )
-    }
 }
 
-struct AccessibleBoardGrid: View {
-    @ObservedObject var game: GameViewModel
-    let board: MinesweeperBoard
+struct AccessibleBoardGrid<Host: BoardHost>: View {
+    @ObservedObject var host: Host
+    let snapshot: BoardSnapshot
 
     var body: some View {
+        let board = snapshot.board
         GeometryReader { geo in
             let size = min(44, floor(geo.size.width / CGFloat(board.cols)))
             ScrollView(.vertical) {
@@ -430,12 +544,13 @@ struct AccessibleBoardGrid: View {
                                     coord: coord,
                                     status: board.status,
                                     size: size,
-                                    isTreasure: game.isTreasure(coord),
-                                    isScanned: game.scannedCell == coord,
-                                    isSatisfied: game.smartFlagsLevel > 0 && isSatisfied(coord)
+                                    isTreasure: snapshot.treasures.contains(coord),
+                                    isScanned: snapshot.scanned == coord,
+                                    isSatisfied: snapshot.dimSatisfied && isSatisfied(coord),
+                                    isDark: snapshot.lit.map { !$0.contains(coord) } ?? false
                                 )
-                                .onTapGesture { game.tap(coord) }
-                                .onLongPressGesture(minimumDuration: game.longPressDuration) { game.longPress(coord) }
+                                .onTapGesture { host.tap(coord) }
+                                .onLongPressGesture(minimumDuration: host.longPressDuration) { host.longPress(coord) }
                             }
                         }
                     }
@@ -448,6 +563,7 @@ struct AccessibleBoardGrid: View {
 
     /// A revealed number whose flags already match it (Smart Flags dims these).
     private func isSatisfied(_ c: Coord) -> Bool {
+        let board = snapshot.board
         let cell = board[c]
         guard cell.state == .revealed, cell.adjacentMines > 0 else { return false }
         return board.neighbors(of: c).filter { board[$0].state == .flagged }.count == cell.adjacentMines
@@ -462,11 +578,13 @@ struct TileView: View {
     var isTreasure = false
     var isScanned = false
     var isSatisfied = false
+    /// Dark Mine: outside the lamp's reach.
+    var isDark = false
 
     var body: some View {
         ZStack {
             RoundedRectangle(cornerRadius: size * 0.18)
-                .fill(background)
+                .fill(isDark ? (cell.state == .revealed ? Palette.navy.opacity(0.45) : Palette.navy) : background)
             if isHiddenLook {
                 RoundedRectangle(cornerRadius: size * 0.18)
                     .strokeBorder(Color.white.opacity(0.35), lineWidth: 2)
@@ -476,7 +594,11 @@ struct TileView: View {
                 RoundedRectangle(cornerRadius: size * 0.18)
                     .strokeBorder(Palette.gold, lineWidth: 3)
             }
-            content
+            if !isDark {
+                content
+            } else if cell.state == .flagged {
+                icon(Art.flag).opacity(0.6)
+            }
         }
         .frame(width: size - 2, height: size - 2)
         .frame(width: size, height: size)
@@ -528,6 +650,7 @@ struct TileView: View {
 
     private var accessibilityText: String {
         let position = "Row \(coord.row + 1), column \(coord.col + 1)"
+        if isDark { return "\(position), dark, \(cell.state == .revealed ? "dug" : cell.state == .flagged ? "flagged" : "not dug")" }
         if cell.isDefused { return "\(position), defused mine" }
         switch cell.state {
         case .flagged: return "\(position), flagged"

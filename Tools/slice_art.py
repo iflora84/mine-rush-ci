@@ -1,7 +1,15 @@
-import sys, os, json
+"""Slices the ChatGPT art sheets in design-canvas/art into the asset catalog.
+
+Usage: python Tools/slice_art.py design-canvas/art App/Assets.xcassets contact.png
+"""
+import json
+import os
+import sys
+
 from PIL import Image
 
 src, assets = sys.argv[1], sys.argv[2]
+
 
 def imageset(name, img, fmt='png'):
     d = os.path.join(assets, f'{name}.imageset')
@@ -14,6 +22,7 @@ def imageset(name, img, fmt='png'):
     json.dump({'images': [{'idiom': 'universal', 'filename': fn}], 'info': {'author': 'xcode', 'version': 1}},
               open(os.path.join(d, 'Contents.json'), 'w'), indent=2)
 
+
 def square(img, size, pad=0.06):
     bbox = img.getchannel('A').point(lambda a: 255 if a > 24 else 0).getbbox()
     img = img.crop(bbox)
@@ -22,24 +31,9 @@ def square(img, size, pad=0.06):
     canvas.paste(img, ((side - img.width) // 2, (side - img.height) // 2))
     return canvas.resize((size, size), Image.LANCZOS)
 
-# Characters: split on empty column gaps.
-chars = Image.open(os.path.join(src, 'minerush-characters.png')).convert('RGBA')
-alpha = chars.getchannel('A')
-w, h = chars.size
-filled = [any(alpha.getpixel((x, y)) > 24 for y in range(0, h, 2)) for x in range(w)]
-runs, start = [], None
-for x, f in enumerate(filled + [False]):
-    if f and start is None: start = x
-    if not f and start is not None:
-        runs.append((start, x)); start = None
-runs = [r for r in runs if r[1] - r[0] > 40]
-print('character columns:', runs)
-assert len(runs) == 3, runs
-for name, (x0, x1) in zip(['worker_milo', 'worker_pip', 'worker_bolt'], runs):
-    imageset(name, square(chars.crop((x0, 0, x1, h)), 512))
 
 def drop_border_bits(img):
-    # Remove alpha islands that touch the cell edge (slivers of neighbouring icons).
+    """Removes small alpha islands touching the cell edge (slivers of neighbouring icons)."""
     a = img.getchannel('A')
     w, h = img.size
     px = a.load()
@@ -62,7 +56,7 @@ def drop_border_bits(img):
                         stack.append((nx, ny))
             comps.append((comp, edge))
     biggest = max(len(c) for c, _ in comps)
-    # Small islands on the edge are neighbours' slivers; the icon itself may touch the edge.
+    # The icon itself may touch the edge; only small edge islands are slivers.
     kill = [p for c, edge in comps if edge and len(c) < biggest * 0.25 for p in c]
     out = img.copy()
     op = out.load()
@@ -70,35 +64,74 @@ def drop_border_bits(img):
         op[x, y] = (0, 0, 0, 0)
     return out
 
-# Icons: 3x3 grid.
-icons = Image.open(os.path.join(src, 'minerush-icons.png')).convert('RGBA')
-names = ['icon_bomb', 'icon_flag', 'icon_coin', 'icon_gem', 'icon_chest', 'icon_pickaxe',
-         'icon_scanner', 'icon_helmet', 'icon_explosion']
-cw, ch = icons.width / 3, icons.height / 3
-for i, name in enumerate(names):
-    r, c = divmod(i, 3)
-    cell = icons.crop((int(c * cw), int(r * ch), int((c + 1) * cw), int((r + 1) * ch)))
-    imageset(name, square(drop_border_bits(cell), 256))
 
-# Backdrops: three vertical panels, trimmed in from the seams.
+def column_sheet(filename, names, size):
+    """A row of characters on transparency, split on empty column gaps."""
+    sheet = Image.open(os.path.join(src, filename)).convert('RGBA')
+    alpha = sheet.getchannel('A')
+    w, h = sheet.size
+    filled = [any(alpha.getpixel((x, y)) > 24 for y in range(0, h, 2)) for x in range(w)]
+    runs, start = [], None
+    for x, f in enumerate(filled + [False]):
+        if f and start is None:
+            start = x
+        if not f and start is not None:
+            runs.append((start, x))
+            start = None
+    runs = [r for r in runs if r[1] - r[0] > 40]
+    print(filename, 'columns:', runs)
+    assert len(runs) == len(names), runs
+    for name, (x0, x1) in zip(names, runs):
+        imageset(name, square(sheet.crop((x0, 0, x1, h)), size))
+
+
+def grid_sheet(filename, names, cols, size):
+    sheet = Image.open(os.path.join(src, filename)).convert('RGBA')
+    rows = (len(names) + cols - 1) // cols
+    cw, ch = sheet.width / cols, sheet.height / rows
+    for i, name in enumerate(names):
+        r, c = divmod(i, cols)
+        cell = sheet.crop((int(c * cw), int(r * ch), int((c + 1) * cw), int((r + 1) * ch)))
+        imageset(name, square(drop_border_bits(cell), size))
+
+
+workers = ['worker_milo', 'worker_pip', 'worker_bolt']
+bosses = ['boss_sunnyQuarry', 'boss_crystalCaves', 'boss_volcanoVault']
+icons = ['icon_bomb', 'icon_flag', 'icon_coin', 'icon_gem', 'icon_chest', 'icon_pickaxe',
+         'icon_scanner', 'icon_helmet', 'icon_explosion']
+powerups = ['powerup_dynamite', 'powerup_radar', 'powerup_magnet', 'powerup_xray']
+backdrops = ['bg_sunnyQuarry', 'bg_crystalCaves', 'bg_volcanoVault']
+
+column_sheet('minerush-characters.png', workers, 512)
+column_sheet('minerush-bosses.png', bosses, 640)
+grid_sheet('minerush-icons.png', icons, 3, 256)
+grid_sheet('minerush-powerups.png', powerups, 2, 256)
+
 bg = Image.open(os.path.join(src, 'minerush-backdrops.png')).convert('RGB')
 pw = bg.width / 3
-for i, name in enumerate(['bg_sunnyQuarry', 'bg_crystalCaves', 'bg_volcanoVault']):
+for i, name in enumerate(backdrops):
     panel = bg.crop((int(i * pw) + 10, 0, int((i + 1) * pw) - 10, bg.height))
     imageset(name, panel.resize((600, 1200), Image.LANCZOS), fmt='jpeg')
 
-# App icon: opaque 1024.
 icon = Image.open(os.path.join(src, 'minerush-appicon.png')).convert('RGB').resize((1024, 1024), Image.LANCZOS)
 icon.save(os.path.join(assets, 'AppIcon.appiconset', 'icon-1024.png'), optimize=True)
 
-# Contact sheet for review.
-sheet = Image.new('RGBA', (1280, 900), (255, 246, 232, 255))
-for i, n in enumerate(['worker_milo', 'worker_pip', 'worker_bolt']):
-    sheet.alpha_composite(Image.open(os.path.join(assets, f'{n}.imageset', f'{n}.png')).resize((240, 240)), (20 + i * 250, 20))
-for i, n in enumerate(names):
-    sheet.alpha_composite(Image.open(os.path.join(assets, f'{n}.imageset', f'{n}.png')).resize((120, 120)), (20 + i * 135, 280))
-for i, n in enumerate(['bg_sunnyQuarry', 'bg_crystalCaves', 'bg_volcanoVault']):
-    sheet.paste(Image.open(os.path.join(assets, f'{n}.imageset', f'{n}.jpg')).resize((200, 400)), (20 + i * 210, 420))
-sheet.paste(icon.resize((400, 400)), (860, 420))
+
+def load(name, ext='png'):
+    return Image.open(os.path.join(assets, f'{name}.imageset', f'{name}.{ext}')).convert('RGBA')
+
+
+sheet = Image.new('RGBA', (1280, 1160), (255, 246, 232, 255))
+for i, n in enumerate(workers):
+    sheet.alpha_composite(load(n).resize((240, 240)), (20 + i * 250, 20))
+for i, n in enumerate(bosses):
+    sheet.alpha_composite(load(n).resize((240, 240)), (20 + i * 250, 270))
+for i, n in enumerate(icons):
+    sheet.alpha_composite(load(n).resize((120, 120)), (20 + i * 135, 530))
+for i, n in enumerate(powerups):
+    sheet.alpha_composite(load(n).resize((120, 120)), (800 + (i % 2) * 135, 20 + (i // 2) * 135))
+for i, n in enumerate(backdrops):
+    sheet.paste(load(n, 'jpg').resize((200, 400)), (20 + i * 210, 680))
+sheet.paste(icon.resize((400, 400)), (860, 680))
 sheet.save(sys.argv[3])
 print('ok')

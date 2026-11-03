@@ -229,6 +229,8 @@ public enum DailyChallenge {
 public struct ExpeditionRun: Codable, Sendable {
     public let id: String
     public let zone: ZoneID
+    /// Every tenth site: a bigger board with a boss whose health is the safe tiles left.
+    public let isBoss: Bool
     public private(set) var board: MinesweeperBoard
     public let treasureCells: Set<Coord>
     public private(set) var foundTreasures: [Coord] = []
@@ -237,10 +239,15 @@ public struct ExpeditionRun: Codable, Sendable {
     public private(set) var coinsThisRun = 0
     public private(set) var moveCount = 0
     public private(set) var isSettled = false
+    public private(set) var combo = ComboTracker()
+    /// Coin Magnet doubles coins until this time.
+    public private(set) var magnetUntil: Double?
 
-    public init(id: String, zone: ZoneID, board: MinesweeperBoard, scannerCharges: Int, helmetCharges: Int, treasureCount: Int) {
+    public init(id: String, zone: ZoneID, board: MinesweeperBoard, scannerCharges: Int, helmetCharges: Int,
+                treasureCount: Int, isBoss: Bool = false) {
         self.id = id
         self.zone = zone
+        self.isBoss = isBoss
         self.board = board
         self.scannerCharges = scannerCharges
         self.helmetCharges = helmetCharges
@@ -255,6 +262,8 @@ public struct ExpeditionRun: Codable, Sendable {
 
     public enum Move {
         case reveal(Coord), chord(Coord), flag(Coord), scan
+        /// The coordinate is the target tile (X-ray uses its row; Magnet ignores it).
+        case item(PowerUp, Coord)
     }
 
     public struct MoveOutcome: Equatable, Sendable {
@@ -263,11 +272,24 @@ public struct ExpeditionRun: Codable, Sendable {
         public var tileCoins = 0
         public var treasures: [Coord] = []
         public var scanned: Coord?
+        public var usedItem: PowerUp?
+        /// Radar Pulse: mines to show briefly.
+        public var radarMines: [Coord] = []
+        /// Set when this move pushed the combo into a higher tier.
+        public var comboTierUp: Int?
+        /// Combo plus Magnet bonus applied to this move's coins, in percent.
+        public var bonusPercent = 0
+        /// Power-ups awarded for clearing the site.
+        public var drops: [PowerUp] = []
+    }
+
+    public func isMagnetActive(at now: Double) -> Bool {
+        (magnetUntil ?? -.infinity) > now
     }
 
     /// Applies a move to the board and prices it. Banking is the caller's job,
     /// keyed by `ledgerID(forMove:)` so a replayed move can't pay twice.
-    public mutating func play(_ move: Move, rewards: RewardCalculator) -> MoveOutcome {
+    public mutating func play(_ move: Move, rewards: RewardCalculator, now: Double = 0) -> MoveOutcome {
         var outcome = MoveOutcome()
         guard !board.status.isOver else { return outcome }
         let shield = helmetCharges > 0
@@ -279,6 +301,20 @@ public struct ExpeditionRun: Codable, Sendable {
         case .flag(let c):
             outcome.flag = board.toggleFlag(c)
             return outcome
+        case .item(let item, let c):
+            outcome.usedItem = item
+            switch item {
+            case .dynamite:
+                outcome.result = board.blast(c)
+            case .xray:
+                outcome.result = board.defuseMines(in: board.row(c.row))
+            case .radar:
+                outcome.radarMines = board.mines(in: board.area(around: c, radius: PowerUp.radarRadius))
+                return outcome
+            case .magnet:
+                magnetUntil = max(magnetUntil ?? now, now) + PowerUp.magnetSeconds
+                return outcome
+            }
         case .scan:
             guard scannerCharges > 0, let hint = PuzzleSolver.hint(for: board) else { return outcome }
             scannerCharges -= 1
@@ -291,11 +327,18 @@ public struct ExpeditionRun: Codable, Sendable {
         }
         if outcome.result.shieldedMine != nil { helmetCharges -= 1 }
         moveCount += 1
+        if outcome.result.hitMine != nil || outcome.result.shieldedMine != nil {
+            combo.reset()
+        } else {
+            outcome.comboTierUp = combo.register(revealed: outcome.result.revealed.count, at: now)
+        }
+        outcome.bonusPercent = combo.bonusPercent + (isMagnetActive(at: now) ? 100 : 0)
         let treasureSet = treasureCells
         outcome.treasures = outcome.result.revealed.filter { treasureSet.contains($0) }
         foundTreasures += outcome.treasures
         outcome.tileCoins = rewards.tiles(outcome.result.revealed.count)
             .addingSaturated(rewards.treasure().multipliedSaturated(outcome.treasures.count))
+            .applyingPercent(100 + outcome.bonusPercent)
         coinsThisRun = coinsThisRun.addingSaturated(outcome.tileCoins)
         return outcome
     }
@@ -308,6 +351,7 @@ public struct ExpeditionRun: Codable, Sendable {
         guard board.status == .won, !isSettled else { return nil }
         isSettled = true
         let coins = rewards.completion(streak: streak)
+            .multipliedSaturated(isBoss ? BossCatalog.rewardMultiplier : 1)
             .addingSaturated(rewards.correctFlags(board.correctFlagCount))
         coinsThisRun = coinsThisRun.addingSaturated(coins)
         return coins
@@ -344,6 +388,12 @@ public struct PlayerProfile: Codable, Sendable {
     public var runCounter = 0
     /// The Expedition site in progress, saved so it survives the app being killed.
     public var activeRun: ExpeditionRun?
+    public var inventory = Inventory.starter
+    public var itemPurchases = 0
+    public var bossesDefeated = 0
+    public var rushBest = 0
+    public var endlessBestDepth = 0
+    public var darkWins = 0
 
     public init() {}
 
@@ -351,6 +401,7 @@ public struct PlayerProfile: Codable, Sendable {
         case ledger, upgrades, workers, zoneClears, expeditionWins, expeditionStreak, bestExpeditionStreak
         case collectibles, classicBest, classicWins, daily, lastActiveAt, passiveMilliRemainder
         case pendingOffline, tutorialCompleted, runCounter, activeRun
+        case inventory, itemPurchases, bossesDefeated, rushBest, endlessBestDepth, darkWins
     }
 
     /// Every field is optional on decode so saves from older builds keep loading
@@ -374,6 +425,12 @@ public struct PlayerProfile: Codable, Sendable {
         tutorialCompleted = try c.decodeIfPresent(Bool.self, forKey: .tutorialCompleted) ?? false
         runCounter = try c.decodeIfPresent(Int.self, forKey: .runCounter) ?? 0
         activeRun = (try? c.decodeIfPresent(ExpeditionRun.self, forKey: .activeRun)) ?? nil
+        inventory = try c.decodeIfPresent(Inventory.self, forKey: .inventory) ?? .starter
+        itemPurchases = try c.decodeIfPresent(Int.self, forKey: .itemPurchases) ?? 0
+        bossesDefeated = try c.decodeIfPresent(Int.self, forKey: .bossesDefeated) ?? 0
+        rushBest = try c.decodeIfPresent(Int.self, forKey: .rushBest) ?? 0
+        endlessBestDepth = try c.decodeIfPresent(Int.self, forKey: .endlessBestDepth) ?? 0
+        darkWins = try c.decodeIfPresent(Int.self, forKey: .darkWins) ?? 0
     }
 
     public func clears(in zone: ZoneID) -> Int {
@@ -401,9 +458,12 @@ public struct PlayerProfile: Codable, Sendable {
 
     /// Board size and opening for the next site in `zone`. Lets the app generate
     /// the (slow, validated) board off the main thread before starting the run.
-    public func nextSiteSpec(in zone: ZoneID) -> (config: BoardConfig, opening: Coord) {
-        let boardConfig = ZoneCatalog.definition(zone).boardConfig(clears: clears(in: zone))
-        return (boardConfig, Coord(row: boardConfig.rows / 2, col: boardConfig.cols / 2))
+    public func nextSiteSpec(in zone: ZoneID) -> (config: BoardConfig, opening: Coord, isBoss: Bool) {
+        let isBoss = BossCatalog.isBossSite(clears: clears(in: zone))
+        let boardConfig = isBoss
+            ? BossCatalog.config(for: zone)
+            : ZoneCatalog.definition(zone).boardConfig(clears: clears(in: zone))
+        return (boardConfig, Coord(row: boardConfig.rows / 2, col: boardConfig.cols / 2), isBoss)
     }
 
     /// Generates the board inline and starts the site. Fine for tests; the app
@@ -430,7 +490,8 @@ public struct PlayerProfile: Codable, Sendable {
             board: board,
             scannerCharges: calc.scannerCharges,
             helmetCharges: calc.helmetCharges,
-            treasureCount: config.treasureTilesPerBoard
+            treasureCount: config.treasureTilesPerBoard,
+            isBoss: BossCatalog.isBossSite(clears: clears(in: zone))
         )
         activeRun = run
         return run
@@ -438,18 +499,24 @@ public struct PlayerProfile: Codable, Sendable {
 
     /// Plays a move on the active run. Nil when there's no site in progress.
     @discardableResult
-    public mutating func playExpedition(_ move: ExpeditionRun.Move, config: EconomyConfig = .standard) -> ExpeditionRun.MoveOutcome? {
+    public mutating func playExpedition(_ move: ExpeditionRun.Move, now: Double = 0,
+                                        config: EconomyConfig = .standard) -> ExpeditionRun.MoveOutcome? {
         guard var run = activeRun else { return nil }
-        let outcome = play(move, in: &run, config: config)
+        let outcome = play(move, in: &run, now: now, config: config)
         activeRun = run
         return outcome
     }
 
     /// Plays a move, banks its coins, and settles the board if it ended.
     @discardableResult
-    public mutating func play(_ move: ExpeditionRun.Move, in run: inout ExpeditionRun, config: EconomyConfig = .standard) -> ExpeditionRun.MoveOutcome {
+    public mutating func play(_ move: ExpeditionRun.Move, in run: inout ExpeditionRun, now: Double = 0,
+                              config: EconomyConfig = .standard) -> ExpeditionRun.MoveOutcome {
+        if case .item(let item, _) = move {
+            // Spend the item only when it can actually be used.
+            guard !run.board.status.isOver, inventory.use(item) else { return ExpeditionRun.MoveOutcome() }
+        }
         let calc = rewards(in: run.zone, config: config)
-        let outcome = run.play(move, rewards: calc)
+        var outcome = run.play(move, rewards: calc, now: now)
         if outcome.tileCoins > 0 {
             ledger.credit(outcome.tileCoins, .coins, id: run.ledgerIDForLastMove)
         }
@@ -465,6 +532,9 @@ public struct PlayerProfile: Codable, Sendable {
                 ledger.credit(bonus, .coins, id: run.ledgerIDForClear)
                 expeditionWins += 1
                 zoneClears[run.zone.rawValue, default: 0] += 1
+                if run.isBoss { bossesDefeated += 1 }
+                outcome.drops = ItemDrops.roll(seed: run.id, count: run.isBoss ? BossCatalog.itemDrops : 1)
+                for item in outcome.drops { inventory.add(item) }
             }
         } else if outcome.result.hitMine != nil {
             expeditionStreak = 0
@@ -494,6 +564,42 @@ public struct PlayerProfile: Codable, Sendable {
         daily.lastCompletedDay = day
         daily.bestSeconds[day] = seconds
         return true
+    }
+
+    // MARK: Arcade modes
+
+    /// Pays a finished Rush / Dark Mine / Endless session once, keyed by its id.
+    @discardableResult
+    public mutating func bankModeReward(id: String, coins: Int) -> Bool {
+        ledger.credit(coins, .coins, id: "mode:\(id)")
+    }
+
+    /// Returns true for a new best.
+    public mutating func recordRush(score: Int) -> Bool {
+        guard score > rushBest else { return false }
+        rushBest = score
+        return true
+    }
+
+    public mutating func recordEndless(depth: Int) -> Bool {
+        guard depth > endlessBestDepth else { return false }
+        endlessBestDepth = depth
+        return true
+    }
+
+    public mutating func recordDarkWin() {
+        darkWins += 1
+    }
+
+    // MARK: Items
+
+    public mutating func buyItem(_ item: PowerUp) -> PurchaseOutcome {
+        guard ledger.spend(item.price, .coins, id: "item:\(item.rawValue):\(itemPurchases + 1)") else {
+            return .insufficientFunds(cost: item.price)
+        }
+        itemPurchases += 1
+        inventory.add(item)
+        return .purchased(newLevel: inventory[item], cost: item.price)
     }
 
     // MARK: Upgrades & workers
