@@ -1,7 +1,6 @@
 import Combine
 import Foundation
 import MineRushCore
-import UIKit
 
 enum PlayMode: String, CaseIterable, Identifiable {
     case expedition, classic, daily
@@ -67,7 +66,6 @@ final class GameViewModel: ObservableObject {
     private var storeObserver: AnyCancellable?
     private var generation = 0
     private var started = false
-    private let haptics = UIImpactFeedbackGenerator(style: .light)
 
     init(store: PlayerStore) {
         self.store = store
@@ -265,21 +263,18 @@ final class GameViewModel: ObservableObject {
         }
     }
 
+    /// Sound, haptics and animation come from BoardScene diffing the board;
+    /// this only handles the clock and the economy side of a move.
     private func react(to result: RevealResult, flag: FlagChange?) {
-        if flag != nil { haptics.impactOccurred() }
         guard let board else { return }
         if board.status == .playing, !clock.isRunning { startClock() }
 
         if result.hitMine != nil {
             stopClock()
-            UINotificationFeedbackGenerator().notificationOccurred(.error)
             if mode == .expedition { store.save() }
         } else if result.didWin {
             stopClock()
-            UINotificationFeedbackGenerator().notificationOccurred(.success)
             settleWin(board)
-        } else if !result.revealed.isEmpty {
-            haptics.impactOccurred(intensity: 0.5)
         }
     }
 

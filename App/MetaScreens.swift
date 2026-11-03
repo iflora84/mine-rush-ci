@@ -1,6 +1,5 @@
 import MineRushCore
 import SwiftUI
-import UIKit
 
 struct CurrencyBar: View {
     let profile: PlayerProfile
@@ -102,7 +101,8 @@ struct UpgradesScreen: View {
                         let outcome = store.buyUpgrade(def.id)
                         notice = purchaseMessage(outcome)
                         if notice == nil {
-                            UINotificationFeedbackGenerator().notificationOccurred(.success)
+                            FeedbackService.shared.haptic(.success)
+                            FeedbackService.shared.play(.coin)
                             bumped = def.id
                         }
                     } label: {
@@ -197,7 +197,10 @@ struct WorkersScreen: View {
             Spacer()
             Button {
                 notice = purchaseMessage(store.hireOrUpgrade(def.id))
-                if notice == nil { UINotificationFeedbackGenerator().notificationOccurred(.success) }
+                if notice == nil {
+                    FeedbackService.shared.haptic(.success)
+                    FeedbackService.shared.play(.coin)
+                }
             } label: {
                 VStack(spacing: 2) {
                     Text(level == 0 ? "Hire" : "Train").font(.caption.bold())

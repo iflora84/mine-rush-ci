@@ -1,4 +1,5 @@
 import MineRushCore
+import SpriteKit
 import SwiftUI
 
 @main
@@ -127,9 +128,11 @@ struct RootView: View {
         .onChange(of: scenePhase, initial: true) { _, phase in
             if phase == .active {
                 store.becameActive()
+                FeedbackService.shared.startMusic()
             } else {
                 game.pause()
                 store.resignedActive()
+                FeedbackService.shared.pauseMusic()
             }
         }
     }
@@ -139,11 +142,21 @@ struct GameScreen: View {
     @ObservedObject var game: GameViewModel
     @ObservedObject var store: PlayerStore
     @State private var showZones = false
+    @State private var showSettings = false
     @State private var confirmNewSite = false
 
     var body: some View {
         VStack(spacing: 10) {
-            CurrencyBar(profile: store.profile)
+            HStack {
+                CurrencyBar(profile: store.profile)
+                Button {
+                    showSettings = true
+                } label: {
+                    Image(systemName: "gearshape.fill").font(.title2)
+                }
+                .tint(Palette.navy)
+                .accessibilityLabel("Settings")
+            }
             Picker("Mode", selection: $game.mode) {
                 ForEach(PlayMode.allCases) { Text($0.title).tag($0) }
             }
@@ -168,6 +181,9 @@ struct GameScreen: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
         .background(backdrop.ignoresSafeArea())
+        .sheet(isPresented: $showSettings) {
+            SettingsScreen()
+        }
         .sheet(isPresented: $showZones) {
             ZoneMapView(store: store) { zone in
                 showZones = false
@@ -350,7 +366,53 @@ struct GameScreen: View {
     }
 }
 
+/// The SpriteKit board, or a plain SwiftUI grid while VoiceOver is running
+/// (every tile is then a real accessibility element with a double-tap action).
 struct BoardView: View {
+    @ObservedObject var game: GameViewModel
+    let board: MinesweeperBoard
+    @State private var scene = BoardScene(size: CGSize(width: 390, height: 600))
+    @Environment(\.accessibilityVoiceOverEnabled) private var voiceOver
+
+    var body: some View {
+        Group {
+            if voiceOver {
+                AccessibleBoardGrid(game: game, board: board)
+            } else {
+                SpriteView(scene: scene, options: [.allowsTransparency])
+                    .onAppear {
+                        scene.onTap = { game.tap($0) }
+                        scene.onLongPress = { game.longPress($0) }
+                        scene.longPressDuration = game.longPressDuration
+                        scene.apply(snapshot)
+                    }
+                    .onChange(of: snapshot) { _, new in
+                        scene.longPressDuration = game.longPressDuration
+                        scene.apply(new)
+                    }
+            }
+        }
+        .overlay {
+            if game.isPaused {
+                RoundedRectangle(cornerRadius: 16)
+                    .fill(Palette.navy.opacity(0.92))
+                    .overlay(Text("Paused").font(.largeTitle.bold()).foregroundStyle(.white))
+                    .onTapGesture { game.togglePause() }
+            }
+        }
+    }
+
+    private var snapshot: BoardSnapshot {
+        BoardSnapshot(
+            board: board,
+            treasures: game.run?.treasureCells.filter { board[$0].state == .revealed } ?? [],
+            scanned: game.scannedCell,
+            dimSatisfied: game.smartFlagsLevel > 0
+        )
+    }
+}
+
+struct AccessibleBoardGrid: View {
     @ObservedObject var game: GameViewModel
     let board: MinesweeperBoard
 
@@ -381,14 +443,6 @@ struct BoardView: View {
                 .frame(maxWidth: .infinity)
             }
             .scrollBounceBehavior(.basedOnSize)
-            .overlay {
-                if game.isPaused {
-                    RoundedRectangle(cornerRadius: 16)
-                        .fill(Palette.navy.opacity(0.92))
-                        .overlay(Text("Paused").font(.largeTitle.bold()).foregroundStyle(.white))
-                        .onTapGesture { game.togglePause() }
-                }
-            }
         }
     }
 
