@@ -7,11 +7,13 @@ struct CurrencyBar: View {
 
     var body: some View {
         HStack(spacing: 14) {
-            Label(profile.ledger.coins.compact, systemImage: "circle.circle.fill")
-                .foregroundStyle(Palette.gold)
+            ArtLabel(text: profile.ledger.coins.compact, image: Art.coin, size: 26)
+                .foregroundStyle(Palette.navy)
+                .accessibilityElement(children: .ignore)
                 .accessibilityLabel("\(profile.ledger.coins) coins")
-            Label(profile.ledger.gems.compact, systemImage: "diamond.fill")
-                .foregroundStyle(Palette.turquoise)
+            ArtLabel(text: profile.ledger.gems.compact, image: Art.gem, size: 24)
+                .foregroundStyle(Palette.navy)
+                .accessibilityElement(children: .ignore)
                 .accessibilityLabel("\(profile.ledger.gems) gems")
             Spacer()
             if profile.teamRateMilli > 0 {
@@ -80,6 +82,7 @@ struct UpgradesScreen: View {
 
         return VStack(alignment: .leading, spacing: 6) {
             HStack {
+                Art.upgrade(def.id).resizable().scaledToFit().frame(width: 34, height: 34)
                 Text(def.name).font(.headline)
                 Spacer()
                 Text("Lv \(level)/\(def.maxLevel)")
@@ -103,7 +106,7 @@ struct UpgradesScreen: View {
                             bumped = def.id
                         }
                     } label: {
-                        Label(cost.compact, systemImage: "circle.circle.fill")
+                        ArtLabel(text: cost.compact, image: Art.coin, size: 18)
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(affordable && lock == nil ? Palette.gold : .gray)
@@ -219,24 +222,18 @@ struct WorkersScreen: View {
     }
 }
 
-/// Placeholder portrait until the character art lands in Phase 3.
 struct WorkerPortrait: View {
     let worker: WorkerID
     let size: CGFloat
 
     var body: some View {
-        let (color, letter): (Color, String) = {
-            switch worker {
-            case .milo: return (Palette.gold, "M")
-            case .pip: return (Palette.turquoise, "P")
-            case .bolt: return (Palette.coral, "B")
-            }
-        }()
-        Circle()
-            .fill(color)
-            .overlay(Circle().strokeBorder(Palette.navy, lineWidth: 3))
-            .overlay(Text(letter).font(.system(size: size * 0.45, weight: .black, design: .rounded)).foregroundStyle(Palette.navy))
+        Art.worker(worker)
+            .resizable()
+            .scaledToFit()
+            .padding(size * 0.06)
             .frame(width: size, height: size)
+            .background(Circle().fill(Palette.cream))
+            .overlay(Circle().strokeBorder(Palette.navy.opacity(0.15), lineWidth: 2))
             .accessibilityHidden(true)
     }
 }
@@ -306,9 +303,12 @@ struct ZoneMapView: View {
             .padding()
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
-                RoundedRectangle(cornerRadius: 18)
-                    .fill(unlocked ? Palette.zone(zone.id) : Palette.navy.opacity(0.55))
+                Art.backdrop(zone.id)
+                    .resizable()
+                    .scaledToFill()
+                    .overlay(unlocked ? Color.white.opacity(0.55) : Palette.navy.opacity(0.7))
             )
+            .clipShape(RoundedRectangle(cornerRadius: 18))
             .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(Palette.navy, lineWidth: isCurrent ? 3 : 0))
         }
         .buttonStyle(.plain)
@@ -331,9 +331,9 @@ struct WelcomeBackView: View {
             }
             Text("Your crew mined for \(durationText(reward.seconds))")
                 .font(.headline)
-            Label(reward.coins.compact, systemImage: "circle.circle.fill")
+            ArtLabel(text: reward.coins.compact, image: Art.coin, size: 44)
                 .font(.system(size: 40, weight: .black, design: .rounded))
-                .foregroundStyle(Palette.gold)
+                .foregroundStyle(Palette.navy)
             if reward.chests > 0 {
                 Text("Pip found \(reward.chests) treasure chest\(reward.chests == 1 ? "" : "s") (included)")
                     .font(.subheadline)

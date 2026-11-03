@@ -51,6 +51,49 @@ enum Palette {
     }
 }
 
+/// Painted assets from Assets.xcassets (sources and slicer: design-canvas/art, Tools/slice_art.py).
+enum Art {
+    static var coin: Image { Image("icon_coin") }
+    static var gem: Image { Image("icon_gem") }
+    static var bomb: Image { Image("icon_bomb") }
+    static var flag: Image { Image("icon_flag") }
+    static var chest: Image { Image("icon_chest") }
+    static var pickaxe: Image { Image("icon_pickaxe") }
+    static var scanner: Image { Image("icon_scanner") }
+    static var helmet: Image { Image("icon_helmet") }
+    static var explosion: Image { Image("icon_explosion") }
+
+    static func worker(_ id: WorkerID) -> Image { Image("worker_\(id.rawValue)") }
+    static func backdrop(_ zone: ZoneID) -> Image { Image("bg_\(zone.rawValue)") }
+
+    static func upgrade(_ id: UpgradeID) -> Image {
+        switch id {
+        case .betterPickaxe, .minerTraining: return pickaxe
+        case .luckyGloves, .comboCharm: return coin
+        case .treasureMagnet, .biggerStorage: return chest
+        case .mineScanner, .extraSupplies: return scanner
+        case .safetyHelmet: return helmet
+        case .smartFlags: return flag
+        case .betterDrill: return worker(.bolt)
+        case .teamEfficiency: return gem
+        }
+    }
+}
+
+/// Text with a painted icon, sized to the surrounding font.
+struct ArtLabel: View {
+    let text: String
+    let image: Image
+    var size: CGFloat = 22
+
+    var body: some View {
+        HStack(spacing: 5) {
+            image.resizable().scaledToFit().frame(width: size, height: size)
+            Text(text)
+        }
+    }
+}
+
 struct RootView: View {
     @ObservedObject var store: PlayerStore
     @ObservedObject var game: GameViewModel
@@ -124,7 +167,7 @@ struct GameScreen: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
-        .background(Palette.cream.ignoresSafeArea())
+        .background(backdrop.ignoresSafeArea())
         .sheet(isPresented: $showZones) {
             ZoneMapView(store: store) { zone in
                 showZones = false
@@ -138,6 +181,18 @@ struct GameScreen: View {
             Button("Keep digging", role: .cancel) {}
         } message: {
             Text("Unfinished sites end your win streak. Coins you've earned are kept.")
+        }
+    }
+
+    @ViewBuilder
+    private var backdrop: some View {
+        if game.mode == .expedition {
+            Art.backdrop(game.run?.zone ?? store.selectedZone)
+                .resizable()
+                .scaledToFill()
+                .overlay(Palette.cream.opacity(0.35))
+        } else {
+            Palette.cream
         }
     }
 
@@ -184,8 +239,10 @@ struct GameScreen: View {
 
     private var statusRow: some View {
         HStack {
-            Label("\(game.board?.minesRemaining ?? 0)", systemImage: "flag.fill")
-                .foregroundStyle(Palette.coral)
+            ArtLabel(text: "\(game.board?.minesRemaining ?? 0)", image: Art.flag, size: 26)
+                .foregroundStyle(Palette.navy)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("\(game.board?.minesRemaining ?? 0) mines left")
             Spacer()
             Text(statusText)
                 .font(.headline)
@@ -242,7 +299,7 @@ struct GameScreen: View {
             Button {
                 game.flagMode.toggle()
             } label: {
-                Label(game.flagMode ? "Flagging" : "Flag", systemImage: "flag")
+                ArtLabel(text: game.flagMode ? "Flagging" : "Flag", image: Art.flag)
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
@@ -252,7 +309,7 @@ struct GameScreen: View {
                 Button {
                     game.scan()
                 } label: {
-                    Label("\(run.scannerCharges)", systemImage: "dot.radiowaves.left.and.right")
+                    ArtLabel(text: "\(run.scannerCharges)", image: Art.scanner)
                 }
                 .buttonStyle(.bordered)
                 .disabled(run.scannerCharges == 0 || run.board.status != .playing)
@@ -260,8 +317,9 @@ struct GameScreen: View {
             }
 
             if let run = game.run, run.helmetCharges > 0 {
-                Label("\(run.helmetCharges)", systemImage: "shield.fill")
-                    .foregroundStyle(Palette.turquoise)
+                ArtLabel(text: "\(run.helmetCharges)", image: Art.helmet, size: 26)
+                    .foregroundStyle(Palette.navy)
+                    .accessibilityElement(children: .ignore)
                     .accessibilityLabel("Safety helmet, \(run.helmetCharges) left")
             }
 
@@ -387,23 +445,31 @@ struct TileView: View {
     private var content: some View {
         let font = Font.system(size: size * 0.55, weight: .black, design: .rounded)
         if cell.isDefused {
-            Image(systemName: "shield.lefthalf.filled").font(font).foregroundStyle(Palette.navy)
+            icon(Art.helmet)
         } else if cell.state == .flagged {
             if status.isOver && !cell.isMine {
                 Image(systemName: "xmark").font(font).foregroundStyle(Palette.coral)
             } else {
-                Image(systemName: "flag.fill").font(font.weight(.bold)).foregroundStyle(Palette.coral)
+                icon(Art.flag)
             }
         } else if cell.isMine && (cell.state == .revealed || status.isOver) {
-            Text("💣").font(.system(size: size * 0.6))
+            if case .lost(let triggered) = status, triggered == coord {
+                icon(Art.explosion, scale: 0.95)
+            } else {
+                icon(Art.bomb)
+            }
         } else if cell.state == .revealed && cell.adjacentMines > 0 {
             Text("\(cell.adjacentMines)")
                 .font(font)
                 .foregroundStyle(Palette.number(cell.adjacentMines))
                 .opacity(isSatisfied ? 0.35 : 1)
         } else if isTreasure {
-            Text("💎").font(.system(size: size * 0.5))
+            icon(Art.chest)
         }
+    }
+
+    private func icon(_ image: Image, scale: CGFloat = 0.78) -> some View {
+        image.resizable().scaledToFit().frame(width: size * scale, height: size * scale)
     }
 
     private var accessibilityText: String {
