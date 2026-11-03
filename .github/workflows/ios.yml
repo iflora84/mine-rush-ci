@@ -1,0 +1,123 @@
+# Engine tests run on free Linux; the macOS job generates the Xcode project with
+# XcodeGen, builds for the simulator, then (private repo, master only) archives
+# ad-hoc signed and uploads to TestFlight with Xcode cloud signing.
+#
+# Secrets (private repo only): ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8 (contents of the .p8).
+name: iOS
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TEAM_ID: UKUPW4MBU8
+  SCHEME: MineRush
+
+jobs:
+  core-tests:
+    runs-on: ubuntu-latest
+    container: swift:6.0
+    steps:
+      - uses: actions/checkout@v4
+      - name: swift test
+        run: swift test --package-path Packages/MineRushCore
+
+  build:
+    needs: core-tests
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          brew install xcodegen
+
+      - name: Generate project
+        run: |
+          sed -i '' "s|CURRENT_PROJECT_VERSION: \"1\"|CURRENT_PROJECT_VERSION: \"${GITHUB_RUN_NUMBER}\"|" project.yml
+          grep -n CURRENT_PROJECT_VERSION project.yml
+          xcodegen generate
+          test -d "${SCHEME}.xcodeproj"
+
+      - name: Simulator build
+        run: |
+          set -o pipefail
+          xcodebuild build -project "${SCHEME}.xcodeproj" -scheme "$SCHEME" \
+            -destination "generic/platform=iOS Simulator" \
+            CODE_SIGNING_ALLOWED=NO \
+            | tee build.log | grep -E "error:|warning: .*\.swift|\*\* BUILD" || true
+          grep -q "\*\* BUILD SUCCEEDED \*\*" build.log
+
+      # Ad-hoc signed ("-", no certificate) so entitlements survive export (SKILL trap 12b).
+      - name: Archive (ad-hoc signed)
+        if: github.event_name != 'pull_request' && !endsWith(github.repository, '-ci')
+        run: |
+          set -o pipefail
+          mkdir -p build
+          xcodebuild -project "${SCHEME}.xcodeproj" -scheme "$SCHEME" \
+            -sdk iphoneos -configuration Release -destination "generic/platform=iOS" \
+            archive -archivePath "build/${SCHEME}.xcarchive" \
+            CURRENT_PROJECT_VERSION="${GITHUB_RUN_NUMBER}" \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="-" PROVISIONING_PROFILE_SPECIFIER="" \
+            CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED=NO AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            | tee build/archive.log | grep -E "error:|\*\* ARCHIVE" || true
+          grep -q "\*\* ARCHIVE SUCCEEDED \*\*" build/archive.log
+
+      - name: App Store Connect API key
+        if: github.event_name != 'pull_request' && !endsWith(github.repository, '-ci')
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          mkdir -p "$HOME/private_keys"
+          printf '%s\n' "$ASC_KEY_P8" > "$HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          chmod 600 "$HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+
+      - name: Upload to TestFlight
+        if: github.event_name != 'pull_request' && !endsWith(github.repository, '-ci')
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          cat > build/export_options.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>${TEAM_ID}</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>uploadSymbols</key><true/>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+          </dict>
+          </plist>
+          PLIST
+          set -o pipefail
+          xcodebuild -exportArchive -archivePath "build/${SCHEME}.xcarchive" \
+            -exportOptionsPlist build/export_options.plist -exportPath build/out \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            | tee build/export.log | grep -E "error:|Upload|\*\* EXPORT" || true
+          grep -q "\*\* EXPORT SUCCEEDED \*\*" build/export.log
+
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-logs
+          path: |
+            build.log
+            build/*.log
+          if-no-files-found: ignore
